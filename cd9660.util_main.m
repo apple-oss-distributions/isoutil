@@ -1,23 +1,24 @@
 /*
- * Copyright (c) 1999 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1999-2002 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
- * Portions Copyright (c) 1999 Apple Computer, Inc.  All Rights
- * Reserved.  This file contains Original Code and/or Modifications of
- * Original Code as defined in and that are subject to the Apple Public
- * Source License Version 1.1 (the "License").  You may not use this file
- * except in compliance with the License.  Please obtain a copy of the
- * License at http://www.apple.com/publicsource and read it before using
- * this file.
+ * Copyright (c) 1999-2003 Apple Computer, Inc.  All Rights Reserved.
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
  * 
  * The Original Code and all software distributed under the License are
- * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
  * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE OR NON- INFRINGEMENT.  Please see the
- * License for the specific language governing rights and limitations
- * under the License.
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
@@ -40,9 +41,15 @@
 
 /* ************************************** I N C L U D E S ***************************************** */
 
-#import <sys/loadable_fs.h>
-#import	<bsd/libc.h>
-#import <bsd/dev/disk.h>
+#include <sys/types.h>
+#include <sys/disk.h>
+#include <sys/errno.h>
+#include <sys/uio.h>
+#include <sys/loadable_fs.h>
+#include <architecture/byte_order.h>
+
+#include <libc.h>
+#include <unistd.h>
 
 #include <CoreFoundation/CFBase.h>
 #include <IOKit/IOKitLib.h>
@@ -55,36 +62,45 @@
 #define	CDROM_BLOCK_SIZE		2048
 #define MAX_BLOCK_TO_SCAN		100
 #define ISO_STANDARD_ID 		"CD001"
-#define ISO_VD_PRIMARY 			0x01  // for ISOVolumeDescriptor.type when it's a primary descriptor
-#define ISO_FS_NAME				"cd9660"
-#define ISO_FS_NAME_NAME		"CDROM (ISO 9660)"
-#define DEFAULT_MOUNT_POINT		"/isoCD"
+#define ISO_FS_NAME			"cd9660"
 #define	MOUNT_COMMAND			"/sbin/mount"
 #define	UMOUNT_COMMAND			"/sbin/umount"
 #define MOUNT_FS_TYPE			"cd9660"
 
-typedef struct ISOVolumeDescriptor
-{
-	char		type[1];
-	char		id[5];			// should be "CD001"
-	char		version[1];
-	char		filler[33];
-	char		volumeID[32];
-	char		filler2[1976];
-} ISOVolumeDescriptor, *ISOVolumeDescriptorPtr;
+#define ISO_VD_BOOT            0
+#define ISO_VD_PRIMARY         1
+#define ISO_VD_SUPPLEMENTARY   2
+#define ISO_VD_PARTITION       3
+#define ISO_VD_END           255
 
+/* Universal Character Set implementation levels (for Joliet) */
+#define ISO_UCS2_Level_1	"%/@"
+#define ISO_UCS2_Level_2	"%/C"
+#define ISO_UCS2_Level_3	"%/E"
 
+struct iso_volumedesc {
+	u_char		vd_type[1];
+	char		vd_id[5];
+	u_char		vd_version[1];
+	u_char		vd_flags[1];
+	u_char		vd_system_id[32];
+	u_char		vd_volume_id[32];
+	u_char		vd_spare[8];
+	u_char		vd_blocks[8];
+	u_char		vd_escape_seq[32];
+	u_char		vd_data[1928];
+} iso_volumedesc;
 
 /* ************************************ P R O T O T Y P E S *************************************** */
 
-static void 			DoDisplayUsage( const char *argv[] );
-static void 			StripTrailingSpaces( char *theContentsPtr );
+static void 	DoDisplayUsage( const char *argv[] );
+static void 	StripTrailingSpaces( char *theContentsPtr );
 
-static void 			DoFileSystemFile( char *theFileNameSuffixPtr, char *theContentsPtr );
-static int 			DoMount( char *theDeviceNamePtr, const char *theMountPointPtr );
-static int 			DoProbe( char *theDeviceNamePtr );
-static int 			DoUnmount( char *theDeviceNamePtr );
-static int 			DoVerifyArgs( int argc, const char *argv[] );
+static void 	DoFileSystemFile( char *theFileNameSuffixPtr, char *theContentsPtr );
+static int	DoMount( char *theDeviceNamePtr, const char *theMountPointPtr, int mnt_flag );
+static int 	DoProbe( char *theDeviceNamePtr );
+static int 	DoUnmount( const char *theDeviceNamePtr );
+static int 	DoVerifyArgs( int argc, const char *argv[], int *mnt_flag);
 
 static int	get_ssector(const char *devpath, int devfd);
 static u_char *	get_cdtoc(const char * devpath);
@@ -109,64 +125,36 @@ int main( int argc, const char *argv[] )
 	int				myError = FSUR_IO_SUCCESS;
 	char				myRawDeviceName[256];
 	char				myDeviceName[256];
+	int mnt_flag;
 
-#if DEBUG
-{
-	int		i;
-	printf("\n cd9660.util - entering with argc of %d \n", argc );
-	
-	for ( i = 0; i < argc; i++ )
-	{
-		printf("argv[%d] is \"%s\" \n", i, argv[i] );
-	}
-}
-#endif //
-
-   	/* Verify our arguments */
-   	if ( (myError = DoVerifyArgs( argc, argv )) != 0 )
-   		goto AllDone;
+	/* Verify our arguments */
+	if ( (myError = DoVerifyArgs( argc, argv, &mnt_flag )) != 0 )
+		goto AllDone;
    		
    	/* Build our device name (full path), should end up with something like: */
-   	/* /dev/sd2a */
-   	strcpy( &myDeviceName[0], DEVICE_PREFIX );
-    strcat( &myDeviceName[0], argv[2] );
+   	/* /dev/disk1s2 */
+	strcpy( &myDeviceName[0], DEVICE_PREFIX );
+	strcat( &myDeviceName[0], argv[2] );
    	strcpy( &myRawDeviceName[0], RAW_DEVICE_PREFIX );
-    strcat( &myRawDeviceName[0], argv[2] );
+	strcat( &myRawDeviceName[0], argv[2] );
    
 	/* call the appropriate routine to handle the given action argument after becoming root */
 	myActionPtr = &argv[1][1];
 	myError = seteuid( 0 );
-#if DEBUG
-                printf ("Error setting uid\n");
-                printf ("Error %d was from seteuid call %s\n",errno,strerror(errno));
-#endif
 
-	myError = setegid( 0 );	// PPD - is this necessary?
-
-#if DEBUG
-                printf ("Error setting gid\n");
-                printf ("Error %d was from setegid call %s\n",errno,strerror(errno));
-#endif
-
-#if DEBUG
-	printf ("Entering the switch with myaction = %s\n",myActionPtr);
-#endif
     switch( *myActionPtr ) 
     {
 	case FSUC_PROBE:
-#if DEBUG
-	    printf ("Calling DoProbe \n");
-#endif
 	    myError = DoProbe( &myRawDeviceName[0] );
 	    break;
 	    
 	case FSUC_MOUNT:
-	case FSUC_MOUNT_FORCE:
-	    myError = DoMount( &myDeviceName[0], argv[3] );
+	case FSUC_MOUNT_FORCE:    
+	    myError = DoMount( &myDeviceName[0], argv[3], mnt_flag );
 	    break;
 	    
 	case FSUC_UNMOUNT:
-        myError = DoUnmount( argv[3] );
+	    myError = DoUnmount( argv[3] );
 	    break;
 	    
 	default:
@@ -177,9 +165,6 @@ int main( int argc, const char *argv[] )
 
 AllDone:
 
-#if DEBUG
-	printf("\n cd9660.util - leaving with result of %d \n", myError );
-#endif //
 
    exit	(myError);
    return myError; /* and make main fit the ANSI spec. */
@@ -192,33 +177,35 @@ Purpose -
 	This routine will fire off a system command to mount the given device at the given mountpoint.
 	NOTE - Workspace will make sure the mountpoint exists and will remove it at Unmount time.
 Input - 
-	theDeviceNamePtr - pointer to the device name (full path, like /dev/rsd2a).
+	theDeviceNamePtr - pointer to the device name (full path, like /dev/rdisk1s2).
 	theMountPointPtr - pointer to the mount point.
 Output -
 	returns FSUR_IO_SUCCESS everything is cool else one of several other FSUR_xxx error codes.
 *************************************************************************************************** */
 
-static int DoMount( char *theDeviceNamePtr, const char *theMountPointPtr )
+static int DoMount( char *theDeviceNamePtr, const char *theMountPointPtr, int mnt_flag )
 {
     int		myError;
     union wait  status;
     int    	pid;
-	
+
     if ( theMountPointPtr == NULL || *theMountPointPtr == 0x00 )
     {
 	myError = FSUR_IO_FAIL;
 	goto ExitThisRoutine;
     }
-	
-    /* ISO 9660 CDs use the system mount command */
+
+   /* ISO 9660 CDs use the system mount command */
     pid = fork();
     if (pid == 0) {
-        myError = execl(MOUNT_COMMAND, MOUNT_COMMAND, "-t", MOUNT_FS_TYPE, theDeviceNamePtr, theMountPointPtr, NULL);
+        myError = execl(MOUNT_COMMAND, MOUNT_COMMAND,
+        	"-t", MOUNT_FS_TYPE,
+        	"-o", "rdonly",
+        	"-o", (mnt_flag & MNT_NODEV ? "nodev" : "dev"),
+        	"-o", (mnt_flag & MNT_NOSUID ? "nosuid" : "suid"),
+        	theDeviceNamePtr, theMountPointPtr, NULL);
 
         /* IF WE ARE HERE, WE WERE UNSUCCESFULL */
-#if DEBUG
-        printf ("Error %d from system command %s\n",myError,strerror(myError));
-#endif
         myError = FSUR_IO_FAIL;
         goto ExitThisRoutine;
     }
@@ -251,12 +238,12 @@ ExitThisRoutine:
 Purpose -
 	This routine will fire off a system command to unmount the given device.
 Input - 
-	theDeviceNamePtr - pointer to the device name (full path, like /dev/sd2a).
+	theDeviceNamePtr - pointer to the device name (full path, like /dev/disk1s2).
 Output -
 	returns FSUR_IO_SUCCESS everything is cool else FSUR_IO_FAIL.
 *************************************************************************************************** */
 
-static int DoUnmount( char *theDeviceNamePtr )
+static int DoUnmount( const char *theDeviceNamePtr )
 {
 	int						myError;
     int						mountflags = 0; /* for future stuff */
@@ -285,109 +272,137 @@ Purpose -
 	This routine will open the given raw device and check to make sure there is media that looks
 	like an ISO 9660 CD.
 Input - 
-	theDeviceNamePtr - pointer to the device name (full path, like /dev/rsd2a).
+	theDeviceNamePtr - pointer to the device name (full path, like /dev/rdisk1s2).
 Output -
 	returns FSUR_RECOGNIZED if we can handle the media else one of the FSUR_xxx error codes.
 *************************************************************************************************** */
 
 static int DoProbe( char *theDeviceNamePtr )
 {
-	int						myError;
-	int 					myFD = 0;
-	int						isFormated = 0;
-	long					myBlockNum;
-	ISOVolumeDescriptorPtr	myISOVolDescPtr;
-	char 					myBuffer[CDROM_BLOCK_SIZE];
-	char 					*myBufferPtr = &myBuffer[0];
+	struct iso_volumedesc * vdp;
+	void *bufp;
 	int sectorsize = 0;
-	long blkoff;
-	long maxblk;
+	int isFormated = 0;
+	daddr_t blkno;
+	daddr_t blkoff;
+	daddr_t maxblk;
+	char bestname[64] = {0};	
+	int fd = 0;
+	int error;
+	int i;
+	u_char type;
 	
-	myFD = open( theDeviceNamePtr, O_RDONLY | O_NDELAY , 0 );
-	if( myFD <= 0 )
-	{
-		
-#if DEBUG
-		printf ("Error opening the device name from DoProbe, Device was %s\n",theDeviceNamePtr);
-		printf ("Error %d was from an open call %s\n",errno,strerror(errno));
-#endif
-		myError = FSUR_IO_FAIL;
-		goto ExitThisRoutine;
+	bufp = malloc(CDROM_BLOCK_SIZE);
+	if (bufp == NULL)
+		return (FSUR_IO_FAIL);
+
+	if ((fd = open(theDeviceNamePtr, O_RDONLY | O_NDELAY , 0)) <= 0) {
+		error = FSUR_IO_FAIL;
+		goto out;
 	}
 
-	/* Make sure we are dealing with a resonable sector size (power of 2) */
-	if ( ioctl(myFD, DKIOCBLKSIZE, &sectorsize) < 0 )
-	{
-		myError = FSUR_IO_FAIL;
-		goto ExitThisRoutine;
+	if ((ioctl(fd, DKIOCGETBLOCKSIZE, &sectorsize) < 0) ||
+	    (ioctl(fd, DKIOCISFORMATTED, &isFormated) != 0) ) {
+		error = FSUR_IO_FAIL;
+		goto out;
 	}
-	if ((sectorsize & (sectorsize-1)) != 0)
-	{
-		myError = FSUR_UNRECOGNIZED;
-		goto ExitThisRoutine;
-	}
-	
-	/* Make sure the device is formatted.  If not, bail immediately. */
-	if ( ioctl( myFD, DKIOCGFORMAT, &isFormated ) != 0 )  
-	{
-		myError = FSUR_IO_FAIL;
-		goto ExitThisRoutine;
-	}
-	if ( isFormated == 0 )
-	{
-		myError = FSUR_UNRECOGNIZED;
-		goto ExitThisRoutine;
+	/*
+	 * Device must be formatted.
+	 * Sector size must be a power of 2.
+	 */
+	if ((isFormated == 0) ||
+	    ((sectorsize & (sectorsize-1)) != 0)) {
+		error = FSUR_UNRECOGNIZED;
+		goto out;
 	}
 
-	blkoff = get_ssector(theDeviceNamePtr, myFD);
+	blkoff = get_ssector(theDeviceNamePtr, fd);
 	maxblk = MAX_BLOCK_TO_SCAN + blkoff;
 
 	/* Scan for the ISO Volume Descriptor.  It should be at block 16 on the CD but may be past */
 	/* block 16.  We'll scan a few blocks looking for it. */
-	myISOVolDescPtr = (ISOVolumeDescriptorPtr) myBufferPtr;
-	myBlockNum = 16 + blkoff;
-	lseek( myFD, (myBlockNum * CDROM_BLOCK_SIZE), 0 );
-	for (; myBlockNum < maxblk; myBlockNum++)
-	{
-		if ( read( myFD, myBufferPtr, CDROM_BLOCK_SIZE ) != CDROM_BLOCK_SIZE )
-		{
-			myError = FSUR_IO_FAIL;
-			goto ExitThisRoutine;
+
+	vdp = (struct iso_volumedesc *) bufp;
+	blkno = 16 + blkoff;
+	lseek(fd, (blkno * CDROM_BLOCK_SIZE), 0);
+
+	for (blkno = 16 + blkoff; blkno < maxblk; blkno++) {
+		if (read(fd, bufp, CDROM_BLOCK_SIZE) != CDROM_BLOCK_SIZE) {
+			error = FSUR_IO_FAIL;
+			goto out;
 		}
+		if (bcmp(vdp->vd_id, ISO_STANDARD_ID,
+		    sizeof(vdp->vd_id)) != 0) {
+		    if (bestname[0] != 0)
+		    	break;
+			error = FSUR_IO_FAIL;
+			goto out;	/* Not ISO 9660 */
+		}
+		type = (u_char)vdp->vd_type[0];
+
+		if (type == ISO_VD_END)
+			break;
 				
-		if ( memcmp( &myISOVolDescPtr->id[0], ISO_STANDARD_ID, sizeof(myISOVolDescPtr->id) ) == 0 )
-		{
-			/* We found a match on id "CD001".  Now make sure type is for the primary descriptor */
-			if ( myISOVolDescPtr->type[0] == ISO_VD_PRIMARY )
-			{
-
-				myISOVolDescPtr->filler2[0] = 0x00; // make sure volume ID is null terminated
-				StripTrailingSpaces(myISOVolDescPtr->volumeID);
-				write(1, myISOVolDescPtr->volumeID,
-				      strlen(myISOVolDescPtr->volumeID));
-				DoFileSystemFile( FS_NAME_SUFFIX, ISO_FS_NAME );
-				DoFileSystemFile( FS_LABEL_SUFFIX,
-						  myISOVolDescPtr->volumeID );
-				break;
-			}
+		if (type == ISO_VD_PRIMARY) {
+			vdp->vd_data[0] = '\0';	/* null terminating */
+			bcopy(vdp->vd_volume_id, bestname, sizeof(vdp->vd_volume_id));
+			bestname[32] = '\0';
 		}
-	} /* end of for loop */
+		if (type == ISO_VD_SUPPLEMENTARY) {
+			CFStringRef cfstr;
+			u_int16_t * uchp;
+			u_char utf8_name[32];
 
-	if ( myBlockNum >= maxblk )
-	{
-		/* Didn't find the ISO volume descriptor */
-		myError = FSUR_UNRECOGNIZED;
-		goto ExitThisRoutine;
+			/*
+			 * Some Joliet CDs are "out-of-spec and don't correctly
+			 * set the SVD flags. We ignore the flags and rely soely
+			 * on the escape sequence.
+			 */
+			if ((bcmp(vdp->vd_escape_seq, ISO_UCS2_Level_1, 3) != 0) &&
+			    (bcmp(vdp->vd_escape_seq, ISO_UCS2_Level_2, 3) != 0) &&
+			    (bcmp(vdp->vd_escape_seq, ISO_UCS2_Level_3, 3) != 0) ) {
+			    continue;
+			}
+			/*
+			 * On Joliet CDs use the UCS-2 volume identifier.
+			 *
+			 * This name can have up to 16 UCS-2 chars.
+			 */
+			uchp = (u_int16_t *)vdp->vd_volume_id;
+			for (i = 0; i < 16 && uchp[i]; ++i) {
+				if (BYTE_ORDER != BIG_ENDIAN)
+					uchp[i] = NXSwapShort(uchp[i]);
+			}
+			cfstr = CFStringCreateWithCharacters(kCFAllocatorDefault, uchp, i);
+			
+			if (CFStringGetCString(cfstr, utf8_name, sizeof(utf8_name),
+			                       kCFStringEncodingUTF8)) {
+				bcopy(utf8_name, bestname, strlen(utf8_name) + 1);
+			}
+			CFRelease(cfstr);
+			if (bestname[0] != 0)
+				break;
+		}
 	}
-	 
-	myError = FSUR_RECOGNIZED;
+
+	if (blkno < maxblk) {
+		StripTrailingSpaces(bestname);
+		write(STDOUT_FILENO, bestname, strlen(bestname));
+		DoFileSystemFile(FS_NAME_SUFFIX, ISO_FS_NAME);
+		DoFileSystemFile(FS_LABEL_SUFFIX, bestname);
+		error = FSUR_RECOGNIZED;
+	} else {
+		error = FSUR_UNRECOGNIZED;
+	}
 	
-ExitThisRoutine:
-	if ( myFD > 0 )
-		close( myFD );
-		
-	return myError;
-		
+out:
+	if (fd > 0)
+		close(fd);
+
+	free(bufp);
+	
+	return (error);
+	
 } /* DoProbe */
 
 
@@ -407,19 +422,20 @@ Purpose -
 		-i (Initialize - not supported)
 
 	deviceArg:
-		sd2 (for example)
+		disk2s3 (for example)
 
 	mountPointArg:
 		/foo/bar/ (required for Mount and Force Mount actions)
 
 	flagsArg:
-		(these are ignored for CDROMs)
 		either "readonly" OR "writable"
 		either "removable" OR "fixed"
+		either "suid" OR "nosuid"
+		either "dev" OR "nodev"
 		
 	examples:
-		cd9660.util -p sd2
-		cd9660.util -m sd2 /cd9660MountPoint
+		cd9660.util -p disk2s3
+		cd9660.util -m disk2s3 /Volumes/cd9660MountPoint
 		
 Input - 
 	argc - the number of arguments in argv.
@@ -428,7 +444,7 @@ Output -
 	returns FSUR_INVAL if we find a bad argument else 0.
 *************************************************************************************************** */
 
-static int DoVerifyArgs( int argc, const char *argv[] )
+static int DoVerifyArgs( int argc, const char *argv[], int *mnt_flag)
 {
 	int			myError = FSUR_INVAL;
 	int			myDeviceLength;
@@ -436,37 +452,48 @@ static int DoVerifyArgs( int argc, const char *argv[] )
 	/* If there are no arguments at all, we'll display useage.  Otherwise we'll just return    */
         /* with FSUR_INVAL.  It is set at the beginning so each of the various if statements below */
   	/* will just jump to the error exit and return myerror unchanged.			   */
-	
+
 	if (argc == 1)
 	{
 		DoDisplayUsage( argv );
 		goto ExitThisRoutine;
 	}
-	
-	
+
 	/* Must have at least 3 arguments and the action argument must start with a '-' */
 	if ( (argc < 3) || (argv[1][0] != '-') )
 	{
 		goto ExitThisRoutine;
 	}
 
-	/* we only support actions Probe, Mount, Force Mount, and Unmount */
-    	if ( !((argv[1][1] == FSUC_PROBE) || (argv[1][1] == FSUC_MOUNT) ||
-    	  (argv[1][1] == FSUC_UNMOUNT) || (argv[1][1] == FSUC_MOUNT_FORCE)) ) 
-        {
-		goto ExitThisRoutine;
-	}
+	switch (argv[1][1])
+	{
+		case FSUC_PROBE:
+			break;
 
-	/* action Mount and ForceMount require 4 arguments (need the mountpoint) */
-     	if ( (argv[1][1] == FSUC_MOUNT) || (argv[1][1] == FSUC_MOUNT_FORCE) )
-    	{
-    		if ( argc < 4 ) 
-    		{
+		case FSUC_MOUNT:
+		case FSUC_MOUNT_FORCE:
+	     		if (argc < 4)
+				goto ExitThisRoutine;
+
+			/* Start with safe defaults */
+			*mnt_flag = MNT_NOSUID | MNT_NODEV | MNT_RDONLY;
+			
+			/* Allow suid and dev overrides */
+			if ((argc > 6) && (strcmp(argv[6],"suid") == 0))
+				*mnt_flag &= ~MNT_NOSUID;
+			if ((argc > 7) && (strcmp(argv[7],"dev") == 0))
+				*mnt_flag &= ~MNT_NODEV;
+			break;
+
+		case FSUC_UNMOUNT:
+			break;
+		
+		default:
+			DoDisplayUsage(argv);
 			goto ExitThisRoutine;
-		}
 	}
 
-	/* Make sure device (argv[2]) is something reasonable (we expect something like "sd2") */
+	/* Make sure device (argv[2]) is something reasonable */
 	myDeviceLength = strlen( argv[2] );
     	if ( myDeviceLength < 2 )
     	{
@@ -499,15 +526,12 @@ static void DoDisplayUsage( const char *argv[] )
     printf("       -%c (Unmount)\n", FSUC_UNMOUNT);
     printf("       -%c (Force Mount)\n", FSUC_MOUNT_FORCE);
     printf("device_arg:\n");
-    printf("       device we are acting upon (for example, \"sd2\")\n");
+    printf("       device we are acting upon (for example, \"disk2s1\")\n");
     printf("mount_point_arg:\n");
     printf("       required for Mount and Force Mount \n");
     printf("Examples:\n");
-    printf("       %s -p sd2 \n", argv[0]);
-    printf("       %s -m sd2 /my/cdrom \n", argv[0]);
-
-	return;
-		
+    printf("       %s -p disk2s1 \n", argv[0]);
+    printf("       %s -m disk2s1 /Volumes/mycdrom \n", argv[0]);
 } /* DoDisplayUsage */
 
 static void StripTrailingSpaces( char *theContentsPtr )
@@ -621,15 +645,15 @@ get_ssector(const char *devpath, int devfd)
 {
 	struct CDTOC * toc_p;
 	struct CDTOC_Desc *toc_desc;
-	struct ISOVolumeDescriptor *isovdp;
+	struct iso_volumedesc *isovdp;
 	char iobuf[CDROM_BLOCK_SIZE];
-	int cmpsize = sizeof(isovdp->id);
+	int cmpsize = sizeof(isovdp->vd_id);
 	int i, count;
 	int ssector;
 	u_char track;
 
 	ssector = 0;
-	isovdp = (struct ISOVolumeDescriptor *)iobuf;
+	isovdp = (struct iso_volumedesc *)iobuf;
 
 	if ((toc_p = (struct CDTOC *)get_cdtoc(devpath)) == NULL)
 		goto exit;
@@ -662,8 +686,8 @@ get_ssector(const char *devpath, int devfd)
 			if (read(devfd, iobuf, CDROM_BLOCK_SIZE) != CDROM_BLOCK_SIZE)
 				continue;
 		
-			if ((memcmp(&isovdp->id[0], ISO_STANDARD_ID, cmpsize) == 0)
-				&& (isovdp->type[0] == ISO_VD_PRIMARY)) {
+			if ((memcmp(isovdp->vd_id, ISO_STANDARD_ID, cmpsize) == 0)
+				&& (isovdp->vd_type[0] == ISO_VD_PRIMARY)) {
 				ssector = sector;
 				break;
 			}
@@ -731,7 +755,7 @@ get_cdtoc(const char * devpath)
 		goto Exit;
 	
 	if ( IORegistryEntryCreateCFProperties(service,
-	                                       &properties,
+	                                       (CFMutableDictionaryRef *)&properties,
 	                                       kCFAllocatorDefault,
 	                                       kNilOptions) != KERN_SUCCESS ) {
 		goto Exit;
